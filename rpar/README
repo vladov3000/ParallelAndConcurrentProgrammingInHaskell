@@ -1,0 +1,5 @@
+To run the experiment, execute:
+   $ cabal run -O2 rpar -- 2 36 35 +RTS -N2 -ls
+
+To see a profile, execute:
+   $ ThreadScope rpar.eventlog
