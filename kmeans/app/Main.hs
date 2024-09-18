@@ -1,6 +1,7 @@
 module Main where
 
 import Control.Monad
+import Control.Parallel.Strategies
 import Data.Array
 import Data.Function
 import Data.List
@@ -17,6 +18,13 @@ import qualified Data.Vector                            as Vector
 import qualified Data.Vector.Mutable                    as MVector
 import qualified Graphics.Rendering.Chart.Easy          as Chart
 import qualified Graphics.Rendering.Chart.Backend.Cairo as Cairo
+
+split :: Int -> [a] -> [[a]]
+split nchunks xs = chunk (length xs `quot` nchunks) xs
+
+chunk :: Int -> [a] -> [[a]]
+chunk _    [] = []
+chunk size xs = let (front, back) = splitAt size xs in front : chunk size back
 
 data Point = Point !Double !Double
   deriving (Show, Eq)
@@ -39,6 +47,12 @@ data PointSum = PointSum !Int !Double !Double
 
 addToPointSum :: PointSum -> Point -> PointSum
 addToPointSum (PointSum n xs ys) (Point x y) = PointSum (n + 1) (xs + x) (ys + y)
+
+addPointSums :: PointSum -> PointSum -> PointSum
+addPointSums (PointSum n xs ys) (PointSum n' xs' ys') = PointSum (n + n') (xs + xs') (ys + ys')
+
+combine :: Vector PointSum -> Vector PointSum -> Vector PointSum
+combine = Vector.zipWith addPointSums
 
 pointSumToCluster :: Int -> PointSum -> Cluster
 pointSumToCluster i (PointSum count xs ys) =
@@ -66,11 +80,11 @@ makeNewClusters pointSums =
   [pointSumToCluster i pointSum | (i, pointSum@(PointSum count _ _)) <- pointSums', count > 0]
   where pointSums' = zip [0..] $ Vector.toList pointSums
 
-step :: Int -> [Cluster] -> [Point] -> [Cluster]
-step nclusters clusters points = makeNewClusters $ assign nclusters clusters points
-
 tooMany :: Int
 tooMany = 1000
+
+step :: Int -> [Cluster] -> [Point] -> [Cluster]
+step nclusters clusters points = makeNewClusters $ assign nclusters clusters points
 
 kmeansSeq :: Int -> [Point] -> [Cluster] -> IO [Cluster]
 kmeansSeq nclusters points startClusters = do
@@ -88,49 +102,87 @@ kmeansSeq nclusters points startClusters = do
             else loop (n + 1) clusters'
     in loop 0 startClusters
 
+parallelStep :: Int -> [Cluster] -> [[Point]] -> [Cluster]
+parallelStep nclusters clusters chunks =
+  makeNewClusters $ foldr1 combine (map (assign nclusters clusters) chunks `using` parList rseq)
+
+kmeansParallel :: Int -> Int -> [Point] -> [Cluster] -> IO [Cluster]
+kmeansParallel nchunks nclusters points startClusters = do
+  let chunks = Main.split nchunks points
+      loop :: Int -> [Cluster] -> IO [Cluster]
+      loop n clusters =
+        if n > tooMany then do
+          putStrLn "Giving up."
+          pure clusters
+        else do
+          printf "Iteration %d\n" n
+          putStr $ unlines $ map show clusters
+          let clusters' = parallelStep nclusters clusters chunks
+          if clusters' == clusters
+            then pure clusters
+            else loop (n + 1) clusters'
+    in loop 0 startClusters
+
 generatePoints :: Int -> Double -> Double -> Double -> Double -> IO [Point]
 generatePoints count meanX meanY stdDevX stdDevY = do
   gen <- newStdGen
-  let (genX, genY) = split gen
+  let (genX, genY) = System.Random.split gen
       xs = normals' (meanX, stdDevX) genX
       ys = normals' (meanY, stdDevY) genY
   pure $ zipWith Point xs $ take count ys
 
+run :: Int -> Int -> Int -> (Int -> [Point] -> [Cluster] -> IO [Cluster]) -> IO ()
+run nClusters minSamples maxSamples kmeans = do
+  samples <- replicateM nClusters $ randomRIO (minSamples, maxSamples)
+  xs      <- replicateM nClusters $ randomRIO (-10, 10)
+  ys      <- replicateM nClusters $ randomRIO (-10, 10)
+  stdDevs <- replicateM nClusters $ randomRIO (1.5, 2)
+      
+  let parameters = zip5 samples xs ys stdDevs stdDevs
+  pointsByCluster <- mapM (\(a, b, c, d, e) -> generatePoints a b c d e) parameters
+  let points = concat pointsByCluster
+
+  gen <- newStdGen
+  let randomClusters  = randomRs (0, nClusters - 1) gen
+      clusterToPoints = accumArray (flip (:)) [] (0, nClusters - 1) $ zip randomClusters points
+      clusters        = map (uncurry makeCluster) $ assocs clusterToPoints
+        
+  finalClusters <- kmeans nClusters points clusters
+  print finalClusters
+
+  Cairo.toFile Chart.def "result.png" $ do
+    Chart.layout_title .= "K-means Clustering"
+    Chart.plot $ Chart.points "Points" $ map pointToTuple points
+    Chart.plot $ Chart.points "Initial Clusters" $ map (pointToTuple . clusterCenter) clusters
+    Chart.plot $ Chart.points "Final Clusters" $ map (pointToTuple . clusterCenter) finalClusters
+    
 main :: IO ()
 main = do
   arguments <- getArgs
   case arguments of
-    [clustersArg, minSamples, maxSamples] -> do
-      nClusters   <- parseInt clustersArg
-      minSamples' <- parseInt minSamples
-      maxSamples' <- parseInt maxSamples
-      
-      samples <- replicateM nClusters $ randomRIO (minSamples', maxSamples')
-      xs      <- replicateM nClusters $ randomRIO (-10, 10)
-      ys      <- replicateM nClusters $ randomRIO (-10, 10)
-      stdDevs <- replicateM nClusters $ randomRIO (1.5, 2)
-      
-      let parameters = zip5 samples xs ys stdDevs stdDevs
-      pointsByCluster <- mapM (\(a, b, c, d, e) -> generatePoints a b c d e) parameters
-      let points = concat pointsByCluster
+    ["sequential", clustersArg, minSamplesArg, maxSamplesArg] -> do
+      nClusters  <- parseInt clustersArg
+      minSamples <- parseInt minSamplesArg
+      maxSamples <- parseInt maxSamplesArg
+      run nClusters minSamples maxSamples kmeansSeq
 
-      gen <- newStdGen
-      let randomClusters  = randomRs (0, nClusters - 1) gen
-      let clusterToPoints = accumArray (flip (:)) [] (0, nClusters - 1) $ zip randomClusters points
-      let clusters        = map (uncurry makeCluster) $ assocs clusterToPoints
-
-      finalClusters <- kmeansSeq nClusters points clusters
-      print finalClusters
-
-      Cairo.toFile Chart.def "result.png" $ do
-            Chart.layout_title .= "K-means Clustering"
-            Chart.plot $ Chart.points "Points" $ map pointToTuple points
-            Chart.plot $ Chart.points "Initial Clusters" $ map (pointToTuple . clusterCenter) clusters
-            Chart.plot $ Chart.points "Final Clusters" $ map (pointToTuple . clusterCenter) finalClusters
+    ["parallel", clustersArg, minSamplesArg, maxSamplesArg, chunksArg] -> do
+      nClusters  <- parseInt clustersArg
+      minSamples <- parseInt minSamplesArg
+      maxSamples <- parseInt maxSamplesArg
+      chunks     <- parseInt chunksArg
+      run nClusters minSamples maxSamples (kmeansParallel chunks)
             
-    _ -> do
-      printf "Error: expected exactly 3 arguments.\nUsage: kmeans CLUSTERS MIN_SAMPLES MAX_SAMPLES\n"
+    command : _ -> do
+      if not $ command `elem` ["sequential", "parallel"] then
+        printf "Error: invalid command %s.\n" command
+      else
+        putStrLn "Error: invalid number of arguments.\n"
+      printUsage
       exitFailure
+
+    [] -> printUsage
+
 
 parseInt :: String -> IO Int
 parseInt arg = case readMaybe arg of
@@ -138,3 +190,9 @@ parseInt arg = case readMaybe arg of
     Nothing  -> do
       printf "Error: %s is not an integer.\n" arg
       exitFailure
+
+printUsage :: IO ()
+printUsage = do
+  putStrLn "Usage: "
+  putStrLn "  kmeans sequential CLUSTERS MIN_SAMPLES MAX_SAMPLES"
+  putStrLn "  kmeans parallel   CLUSTERS MIN_SAMPLES MAX_SAMPLES N_CHUNKS"
