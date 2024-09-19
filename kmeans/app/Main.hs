@@ -86,16 +86,17 @@ tooMany = 1000
 step :: Int -> [Cluster] -> [Point] -> [Cluster]
 step nclusters clusters points = makeNewClusters $ assign nclusters clusters points
 
-kmeansSeq :: Int -> [Point] -> [Cluster] -> IO [Cluster]
-kmeansSeq nclusters points startClusters = do
+kmeansSeq :: Bool -> Int -> [Point] -> [Cluster] -> IO [Cluster]
+kmeansSeq verbose nclusters points startClusters = do
   let loop :: Int -> [Cluster] -> IO [Cluster]
       loop n clusters =
         if n > tooMany then do
-          putStrLn "Giving up."
+          when verbose $ putStrLn "Giving up."
           pure clusters
         else do
-          printf "Iteration %d\n" n
-          putStr $ unlines $ map show clusters
+          when verbose $ do
+            printf "Iteration %d\n" n
+            putStr $ unlines $ map show clusters
           let clusters' = step nclusters clusters points
           if clusters' == clusters
             then pure clusters
@@ -106,17 +107,18 @@ parallelStep :: Int -> [Cluster] -> [[Point]] -> [Cluster]
 parallelStep nclusters clusters chunks =
   makeNewClusters $ foldr1 combine (map (assign nclusters clusters) chunks `using` parList rseq)
 
-kmeansParallel :: Int -> Int -> [Point] -> [Cluster] -> IO [Cluster]
-kmeansParallel nchunks nclusters points startClusters = do
+kmeansParallel :: Int -> Bool -> Int -> [Point] -> [Cluster] -> IO [Cluster]
+kmeansParallel nchunks verbose nclusters points startClusters = do
   let chunks = Main.split nchunks points
       loop :: Int -> [Cluster] -> IO [Cluster]
       loop n clusters =
         if n > tooMany then do
-          putStrLn "Giving up."
+          when verbose $ putStrLn "Giving up."
           pure clusters
         else do
-          printf "Iteration %d\n" n
-          putStr $ unlines $ map show clusters
+          when verbose $ do
+            printf "Iteration %d\n" n
+            putStr $ unlines $ map show clusters
           let clusters' = parallelStep nclusters clusters chunks
           if clusters' == clusters
             then pure clusters
@@ -131,8 +133,17 @@ generatePoints count meanX meanY stdDevX stdDevY = do
       ys = normals' (meanY, stdDevY) genY
   pure $ zipWith Point xs $ take count ys
 
-run :: Int -> Int -> Int -> (Int -> [Point] -> [Cluster] -> IO [Cluster]) -> IO ()
-run nClusters minSamples maxSamples kmeans = do
+data Arguments = Arguments
+  { getKmeans     :: (Bool -> Int -> [Point] -> [Cluster] -> IO [Cluster])
+  , getNClusters  :: Int
+  , getMinSamples :: Int
+  , getMaxSamples :: Int
+  , getShouldPlot :: Bool
+  , getVerbose    :: Bool
+  }
+
+run :: Arguments -> IO ()
+run (Arguments kmeans nClusters minSamples maxSamples shouldPlot verbose) = do
   samples <- replicateM nClusters $ randomRIO (minSamples, maxSamples)
   xs      <- replicateM nClusters $ randomRIO (-10, 10)
   ys      <- replicateM nClusters $ randomRIO (-10, 10)
@@ -147,42 +158,56 @@ run nClusters minSamples maxSamples kmeans = do
       clusterToPoints = accumArray (flip (:)) [] (0, nClusters - 1) $ zip randomClusters points
       clusters        = map (uncurry makeCluster) $ assocs clusterToPoints
         
-  finalClusters <- kmeans nClusters points clusters
+  finalClusters <- kmeans verbose nClusters points clusters
   print finalClusters
 
-  Cairo.toFile Chart.def "result.png" $ do
-    Chart.layout_title .= "K-means Clustering"
-    Chart.plot $ Chart.points "Points" $ map pointToTuple points
-    Chart.plot $ Chart.points "Initial Clusters" $ map (pointToTuple . clusterCenter) clusters
-    Chart.plot $ Chart.points "Final Clusters" $ map (pointToTuple . clusterCenter) finalClusters
-    
+  when shouldPlot $ do
+    Cairo.toFile Chart.def "result.png" $ do
+      Chart.layout_title .= "K-means Clustering"
+      Chart.plot $ Chart.points "Points" $ map pointToTuple points
+      Chart.plot $ Chart.points "Initial Clusters" $ map (pointToTuple . clusterCenter) clusters
+      Chart.plot $ Chart.points "Final Clusters" $ map (pointToTuple . clusterCenter) finalClusters
+
+parseArguments :: [String] -> IO Arguments
+parseArguments (command : clustersArg : minSamplesArg : maxSamplesArg : rest) = do
+  kmeans <- case command of
+        "sequential" -> pure kmeansSeq
+        "parallel"   -> do
+          case rest of
+            chunksArg : _ -> kmeansParallel <$> parseInt chunksArg
+            []            -> do
+              putStrLn "Error: missing chunks when parallel mode specified."
+              exitFailure
+        _          -> do
+          printf "Error: invalid command %s.\n" command
+          exitFailure
+  
+  nClusters  <- parseInt clustersArg
+  minSamples <- parseInt minSamplesArg
+  maxSamples <- parseInt maxSamplesArg
+
+  case elemIndex "--seed" rest of
+    Just seedIndex ->
+      case rest !? (seedIndex + 1) of
+        Just seedArg -> parseInt seedArg >>= setStdGen . mkStdGen
+        Nothing      -> do
+          putStrLn "Error: --seed missing value."
+          exitFailure
+    Nothing -> pure ()
+
+  let shouldPlot = elem "--plot"    rest
+  let verbose    = elem "--verbose" rest
+  pure $ Arguments kmeans nClusters minSamples maxSamples shouldPlot verbose
+  
+parseArguments _ = do
+  putStrLn "Error: invalid number of arguments."
+  exitFailure
+  
 main :: IO ()
 main = do
-  arguments <- getArgs
-  case arguments of
-    ["sequential", clustersArg, minSamplesArg, maxSamplesArg] -> do
-      nClusters  <- parseInt clustersArg
-      minSamples <- parseInt minSamplesArg
-      maxSamples <- parseInt maxSamplesArg
-      run nClusters minSamples maxSamples kmeansSeq
-
-    ["parallel", clustersArg, minSamplesArg, maxSamplesArg, chunksArg] -> do
-      nClusters  <- parseInt clustersArg
-      minSamples <- parseInt minSamplesArg
-      maxSamples <- parseInt maxSamplesArg
-      chunks     <- parseInt chunksArg
-      run nClusters minSamples maxSamples (kmeansParallel chunks)
-            
-    command : _ -> do
-      if not $ command `elem` ["sequential", "parallel"] then
-        printf "Error: invalid command %s.\n" command
-      else
-        putStrLn "Error: invalid number of arguments.\n"
-      printUsage
-      exitFailure
-
-    [] -> printUsage
-
+  arguments       <- getArgs
+  parsedArguments <- parseArguments arguments
+  run parsedArguments
 
 parseInt :: String -> IO Int
 parseInt arg = case readMaybe arg of
@@ -194,5 +219,5 @@ parseInt arg = case readMaybe arg of
 printUsage :: IO ()
 printUsage = do
   putStrLn "Usage: "
-  putStrLn "  kmeans sequential CLUSTERS MIN_SAMPLES MAX_SAMPLES"
-  putStrLn "  kmeans parallel   CLUSTERS MIN_SAMPLES MAX_SAMPLES N_CHUNKS"
+  putStrLn "  kmeans sequential CLUSTERS MIN_SAMPLES MAX_SAMPLES [--seed SEED] [--plot] [--verbose]"
+  putStrLn "  kmeans parallel   CLUSTERS MIN_SAMPLES MAX_SAMPLES N_CHUNKS [--seed SEED] [--plot] [--verbose]"
