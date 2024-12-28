@@ -56,7 +56,7 @@ executable rsa
 
     -- .hs or .lhs file containing the Main module.
     main-is:          Main.hs
-    ghc-options:      -O2
+    ghc-options:      -O2 -rtsopts -threaded
 
     -- Modules included in this executable, other than Main.
     -- other-modules:
@@ -65,7 +65,11 @@ executable rsa
     -- other-extensions:
 
     -- Other library packages from which modules are imported.
-    build-depends:    base ^>=4.19.1.0, random ^>=1.2.1.2, split ^>=0.2.5
+    build-depends:    base       ^>=4.19.1.0
+                    , random     ^>=1.2.1.2
+                    , split      ^>=0.2.5
+                    , parallel   ^>=3.2.2.0
+                    , bytestring ^>=0.12.2.0
 
     -- Directories containing source files.
     hs-source-dirs:   app

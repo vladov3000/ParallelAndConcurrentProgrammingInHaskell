@@ -1,12 +1,15 @@
 module Main where
 
-import Data.List
-import Data.List.Split
+import Control.Parallel.Strategies
+import Data.ByteString.Lazy.Char8 (ByteString)
+import Data.List.Split (splitOn)
 import System.Environment
 import System.Exit
 import System.Random
 import Text.Printf
 import Text.Read
+
+import qualified Data.ByteString.Lazy.Char8 as B
 
 main :: IO ()
 main = do
@@ -18,13 +21,15 @@ main = do
       let (n, d, e) = makeKeys r s
       printf "Public key:  %d,%d\n" n d
       printf "Private key: %d,%d\n" n e
-    ["encrypt", privateKey, input] -> do
+    ["encrypt", privateKey, inputPath] -> do
+      input <- readInput inputPath
       (n, e) <- parseKey privateKey
-      putStrLn $ encrypt n e input
-    ["decrypt", publicKey, input] -> do
+      B.putStr $ encrypt n e input
+    ["decrypt", publicKey, inputPath] -> do
+      input <- readInput inputPath
       (n, d) <- parseKey publicKey
       case decrypt n d input of
-        Just output -> putStrLn output
+        Just output -> B.putStr output
         Nothing     -> do
           putStrLn "Error: invalid input."
           exitFailure
@@ -35,6 +40,11 @@ main = do
       putStrLn "  rsa encrypt PRIVATE_KEY INPUT"
       putStrLn "  rsa decrypt PUBLIC_KEY  INPUT"
       exitFailure
+
+readInput :: String -> IO ByteString
+readInput inputPath = case inputPath of
+  "-" -> B.getContents 
+  _   -> B.readFile inputPath
 
 makeKeys :: Integer -> Integer -> (Integer, Integer, Integer)
 makeKeys r s = (p * q, d, invert ((p - 1) * (q - 1)) d)
@@ -81,19 +91,28 @@ parseInteger input =
       printf "Error: %s is not an integer.\n" input
       exitFailure
 
-encrypt :: Integer -> Integer -> String -> String
-encrypt n e input = concatMap (show . power e n . code) $ chunksOf (size n) input
+encrypt :: Integer -> Integer -> ByteString -> ByteString
+encrypt n e = B.unlines
+  . withStrategy (parBuffer 100 rdeepseq)
+  . map (B.pack . show . power e n . code) 
+  . chunk (size n)
+
+chunk :: Int -> ByteString -> [ByteString]
+chunk n s = if B.null s 
+  then []
+  else as : chunk n bs
+    where (as, bs) = B.splitAt (fromIntegral n) s
 
 size :: Integer -> Int
 size n = (length (show n) * 47) `div` 100 -- log_128 10 = 0.4745
 
-decrypt :: Integer -> Integer -> String -> Maybe String
+decrypt :: Integer -> Integer -> ByteString -> Maybe ByteString
 decrypt n d input = do
-  chunks <- mapM readMaybe $ lines input
-  pure $ concatMap (decode . power d n) chunks
+  chunks <- mapM B.readInteger $ B.lines input
+  pure $ B.concat $ map (B.pack . decode . power d n . fst) chunks
 
-code :: String -> Integer
-code = foldl' (\acc c -> 128 * acc + fromIntegral (fromEnum c)) 0
+code :: ByteString -> Integer
+code = B.foldl' (\acc c -> 128 * acc + fromIntegral (fromEnum c)) 0
 
 decode :: Integer -> String
 decode n = reverse (expand n)
